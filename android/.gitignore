@@ -1,0 +1,7 @@
+.gradle/
+build/
+local.properties
+core/target/
+app/src/main/jniLibs/
+dist/
+env.local.sh

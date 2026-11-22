@@ -1,0 +1,435 @@
+#!/usr/bin/env python3
+"""Syncs Hex's vocabulary between desktop Hex and Hex for Android.
+
+    hex-vocab-sync serve       answer the phone over Tailscale (the user service runs this)
+    hex-vocab-sync pair        give the phone this laptop's address and token over USB (adb)
+    hex-vocab-sync self-test   check the merge
+
+The phone POSTs its list and the base (the list both sides agreed on at the
+last sync) to /v1/vocabulary/sync. This merges three ways against desktop
+Hex's list, applies the difference to desktop Hex through its own CLI
+(`hex vocabulary add/remove`), and returns desktop Hex's list as it now
+stands; the phone keeps that as its list and its new base. An addition or a
+deletion on either side survives; an entry deleted on one side and edited on
+the other is kept. A sync that would delete more than half of desktop Hex's
+terms (at least 3) is refused; delete that many on the desktop instead.
+
+The listener binds only this machine's Tailscale addresses (IPv4 and IPv6) and
+needs a bearer token, kept in the GNOME Keyring (service hex-vocab-sync, key
+token). The token is never printed; `pair` hands it to the phone over USB,
+together with this machine's MagicDNS name (the app only allows plain HTTP to
+*.ts.net names). With several adb devices attached, set ANDROID_SERIAL first.
+"""
+import hmac
+import ipaddress
+import json
+import os
+import secrets
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import traceback
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+PORT = int(os.environ.get("HEX_VOCAB_SYNC_PORT", "47390"))
+PACKAGE = "app.hexforandroid"
+KEYRING = ["service", "hex-vocab-sync", "key", "token"]
+LOCK = threading.Lock()
+DEADLINE = 0.0  # time.monotonic() by which the sync in progress (holding LOCK) must finish
+
+# Hex rejects more than these.
+MAX_TERM = 64  # characters, for a term and for a spelling
+MAX_SPELLINGS = 16
+MAX_ENTRIES = 500
+MAX_BODY = 1 << 20
+SYNC_SECONDS = 25  # the phone gives up after 30
+COMMAND_SECONDS = 20
+
+
+def log(*parts):
+    print(*parts, file=sys.stderr, flush=True)
+
+
+class Refused(Exception):
+    """A request we turn down; the message is meant for the phone's user."""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+# --- Merge ------------------------------------------------------------------
+
+def tidy(text):
+    return " ".join(text.split())
+
+
+def key(text):
+    return tidy(text).lower()
+
+
+def text(value):
+    return tidy(value) if isinstance(value, str) else ""
+
+
+def clean(entries):
+    """Entries as Hex stores them: tidy text, comma-split spellings, no duplicates."""
+    out, seen = [], set()
+    for entry in entries if isinstance(entries, list) else []:
+        term = text(entry.get("term")) if isinstance(entry, dict) else ""
+        if not term or key(term) in seen:
+            continue
+        seen.add(key(term))
+        spellings, seen_spellings = [], {key(term)}  # a spelling equal to its term is no spelling
+        sounds = entry.get("sounds_like")
+        for raw in sounds if isinstance(sounds, list) else []:
+            for s in text(raw).split(","):
+                s = tidy(s)
+                if s and key(s) not in seen_spellings:
+                    seen_spellings.add(key(s))
+                    spellings.append(s)
+        out.append({"term": term, "sounds_like": spellings})
+    return out
+
+
+def limit(entries):
+    """Drops or trims what `hex vocabulary add` would reject, so one bad entry can't fail every sync."""
+    out = []
+    for entry in entries:
+        if len(entry["term"]) > MAX_TERM:
+            continue
+        spellings = [s for s in entry["sounds_like"] if len(s) <= MAX_TERM][:MAX_SPELLINGS]
+        out.append({"term": entry["term"], "sounds_like": spellings})
+    return out[:MAX_ENTRIES]
+
+
+def changed(before, after):
+    return before["term"] != after["term"] or {key(s) for s in before["sounds_like"]} != {key(s) for s in after["sounds_like"]}
+
+
+def merge_entry(b, d, p):
+    base = {key(s) for s in b["sounds_like"]} if b else set()
+    ds = {key(s) for s in d["sounds_like"]}
+    ps = {key(s) for s in p["sounds_like"]}
+    spellings, seen = [], set()
+    for s in d["sounds_like"] + p["sounds_like"]:
+        k = key(s)
+        if k in seen:
+            continue
+        if (k in ds and k in ps) or (k in ds and k not in base) or (k in ps and k not in base):
+            seen.add(k)
+            spellings.append(s)
+    term = d["term"]
+    if b and p["term"] != b["term"] and d["term"] == b["term"]:
+        term = p["term"]
+    return {"term": term, "sounds_like": spellings}
+
+
+def merge(base, desktop, phone):
+    base, desktop, phone = clean(base), clean(desktop), clean(phone)
+    B = {key(e["term"]): e for e in base}
+    D = {key(e["term"]): e for e in desktop}
+    P = {key(e["term"]): e for e in phone}
+    order = [key(e["term"]) for e in desktop] + [key(e["term"]) for e in phone if key(e["term"]) not in D]
+    result = []
+    for k in order:
+        b, d, p = B.get(k), D.get(k), P.get(k)
+        if d and p:
+            result.append(merge_entry(b, d, p))
+        elif d:
+            if b is None or changed(b, d):
+                result.append(d)
+        elif p:
+            if b is None or changed(b, p):
+                result.append(p)
+    return limit(result)
+
+
+def refuse_mass_delete(desktop, result):
+    """A phone with a wiped or broken list must not empty the desktop's vocabulary."""
+    kept = {key(e["term"]) for e in result}
+    gone = sum(1 for e in desktop if key(e["term"]) not in kept)
+    if gone > max(3, len(desktop) / 2):
+        raise Refused(409, f"Refusing to delete {gone} terms from desktop Hex in one sync; delete them on the desktop instead")
+
+
+# --- Desktop Hex --------------------------------------------------------------
+
+class HexNotRunning(Exception):
+    pass
+
+
+def hex_cli(command, term=None, sounds=(), grace=False):
+    """Runs `hex vocabulary <command>`. `grace` ignores the sync deadline (to undo a half-done change)."""
+    argv = ["hex", "vocabulary", command, "--json"]
+    if sounds:
+        argv += ["--sounds-like", ",".join(sounds)]
+    if term is not None:
+        argv += ["--", term]  # so a term starting with "-" is not read as an option
+    timeout = COMMAND_SECONDS if grace else min(COMMAND_SECONDS, DEADLINE - time.monotonic())
+    if timeout <= 0:
+        raise subprocess.TimeoutExpired(argv, 0)
+    done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    if done.returncode == 3:
+        raise HexNotRunning()
+    if done.returncode != 0:
+        raise RuntimeError(f"hex vocabulary {command} failed: {done.stderr.strip() or done.stdout.strip()}")
+    return json.loads(done.stdout) if done.stdout.strip() else {}
+
+
+def desktop_list():
+    return clean(hex_cli("list").get("entries", []))
+
+
+def replace(current, entry):
+    """The CLI only adds, so a rename or dropped spelling is remove then add.
+    If that fails half way, put the original back: the phone still holds the
+    term, and a term missing on desktop would be deleted there at the next sync."""
+    try:
+        hex_cli("remove", current["term"])
+        hex_cli("add", entry["term"], entry["sounds_like"])
+    except Exception:
+        try:
+            hex_cli("add", current["term"], current["sounds_like"], grace=True)
+        except Exception as error:
+            log(f"could not restore {current['term']!r} on desktop Hex: {error}")
+        raise
+
+
+def apply(desktop, result):
+    """Changes desktop Hex's list into `result` with add and remove."""
+    D = {key(e["term"]): e for e in desktop}
+    R = {key(e["term"]): e for e in result}
+    for k, entry in D.items():
+        if k not in R:
+            hex_cli("remove", entry["term"])
+    for entry in result:
+        current = D.get(key(entry["term"]))
+        if current is None:
+            hex_cli("add", entry["term"], entry["sounds_like"])
+            continue
+        have = {key(s) for s in current["sounds_like"]}
+        want = {key(s) for s in entry["sounds_like"]}
+        if current["term"] != entry["term"] or not have <= want:
+            replace(current, entry)
+        elif want - have:
+            hex_cli("add", entry["term"], [s for s in entry["sounds_like"] if key(s) not in have])
+
+
+def sync(base, phone):
+    global DEADLINE
+    start = time.monotonic()
+    if not LOCK.acquire(timeout=SYNC_SECONDS):
+        raise Refused(503, "Another sync is still running; try again")
+    try:
+        DEADLINE = start + SYNC_SECONDS  # lock wait and work together stay inside the phone's timeout
+        desktop = desktop_list()
+        result = merge(base, desktop, phone)
+        if [(e["term"], e["sounds_like"]) for e in result] != [(e["term"], e["sounds_like"]) for e in desktop]:
+            refuse_mass_delete(desktop, result)
+            apply(desktop, result)
+            return desktop_list()
+        return desktop
+    finally:
+        LOCK.release()
+
+
+# --- Server -------------------------------------------------------------------
+
+def token():
+    done = subprocess.run(["secret-tool", "lookup", *KEYRING], capture_output=True, text=True)
+    value = done.stdout.strip()
+    if not value:
+        sys.exit("no sync token in the keyring; run `hex-vocab-sync pair` first")
+    return value
+
+
+def tailnet_addresses():
+    """This machine's Tailscale IPv4 and IPv6 addresses (whichever it has)."""
+    found = []
+    for flag in ("-4", "-6"):
+        done = subprocess.run(["tailscale", "ip", flag], capture_output=True, text=True)
+        for line in done.stdout.split()[:1]:
+            try:
+                found.append(str(ipaddress.ip_address(line)))
+            except ValueError:
+                pass
+    if not found:
+        sys.exit("Tailscale has no address; is it up?")
+    return found
+
+
+def tailnet_name():
+    """This machine's MagicDNS name, or "" if it has none."""
+    done = subprocess.run(["tailscale", "status", "--json"], capture_output=True, text=True)
+    try:
+        return json.loads(done.stdout)["Self"]["DNSName"].rstrip(".")
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return ""
+
+
+def objects(value):
+    return isinstance(value, list) and all(isinstance(item, dict) for item in value)
+
+
+class Handler(BaseHTTPRequestHandler):
+    secret = ""
+    timeout = 10  # a stalled client must not hold a thread forever
+
+    def reply(self, code, body):
+        data = json.dumps(body).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def authorized(self):
+        header = self.headers.get("Authorization", "")
+        return header.startswith("Bearer ") and hmac.compare_digest(header[7:].encode(), self.secret.encode())
+
+    def read_lists(self):
+        """The request's (base, entries); on a bad request replies and returns None."""
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = -1
+        if length < 0:
+            return self.reply(400, {"error": "Bad request"})
+        if length > MAX_BODY:
+            return self.reply(413, {"error": "Request too large"})
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except ValueError:
+            body = None
+        if not isinstance(body, dict) or not objects(body.get("base")) or not objects(body.get("entries")):
+            return self.reply(400, {"error": "Bad request"})
+        return body["base"], body["entries"]
+
+    def do_GET(self):
+        if self.path == "/v1/health":
+            return self.reply(200, {"ok": True})
+        self.reply(404, {"error": "Not found"})
+
+    def do_POST(self):
+        if self.path != "/v1/vocabulary/sync":
+            return self.reply(404, {"error": "Not found"})
+        if not self.authorized():
+            return self.reply(401, {"error": "This phone isn't paired. Run hex-vocab-sync pair"})
+        lists = self.read_lists()
+        if lists is None:
+            return
+        try:
+            entries = sync(*lists)
+            self.reply(200, {"entries": entries, "desktop": socket.gethostname()})
+        except HexNotRunning:
+            self.reply(503, {"error": f"Desktop Hex isn't running on {socket.gethostname()}"})
+        except Refused as refusal:
+            self.reply(refusal.code, {"error": str(refusal)})
+        except subprocess.TimeoutExpired:
+            self.reply(503, {"error": "Desktop Hex took too long to answer; try again"})
+        except Exception:  # Report, don't crash the listener; details stay in the log.
+            traceback.print_exc()
+            self.reply(500, {"error": "Sync failed; see the log on the laptop"})
+
+    def log_message(self, fmt, *args):
+        # One line per request, without bodies (they hold the vocabulary).
+        sys.stderr.write("%s %s\n" % (self.address_string(), fmt % args))
+
+
+class Server6(ThreadingHTTPServer):
+    address_family = socket.AF_INET6
+
+
+def serve():
+    Handler.secret = token()
+    servers = []
+    for address in tailnet_addresses():
+        kind = Server6 if ":" in address else ThreadingHTTPServer
+        servers.append(kind((address, PORT), Handler))
+        print(f"hex-vocab-sync listening on {address}:{PORT}", flush=True)
+    for server in servers[1:]:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+    servers[0].serve_forever()
+
+
+# --- Pairing ------------------------------------------------------------------
+
+def pair():
+    existing = subprocess.run(["secret-tool", "lookup", *KEYRING], capture_output=True, text=True).stdout.strip()
+    if not existing:
+        existing = secrets.token_urlsafe(32)
+        subprocess.run(["secret-tool", "store", "--label", "Hex vocabulary sync token", *KEYRING],
+                       input=existing, text=True, check=True)
+    host = tailnet_name()
+    if not host:
+        address = tailnet_addresses()[0]
+        host = f"[{address}]" if ":" in address else address
+        log("warning: no MagicDNS name; the app only allows plain HTTP to *.ts.net names, so it will refuse this URL")
+    url = f"http://{host}:{PORT}"
+    pairing = json.dumps({"url": url, "token": existing, "desktop": socket.gethostname()})
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:  # mode 0600 already
+        handle.write(pairing)
+        path = handle.name
+    try:
+        target = f"/sdcard/Android/data/{PACKAGE}/files/pair.json"
+        subprocess.run(["adb", "push", path, target], check=True, capture_output=True)
+    finally:
+        os.unlink(path)
+    print(f"Paired: Hex on the phone syncs with {url} from its next start (token in the keyring, not shown)")
+
+
+# --- Self-test ----------------------------------------------------------------
+
+def self_test():
+    def e(term, *s):
+        return {"term": term, "sounds_like": list(s)}
+
+    def refused(desktop, result):
+        try:
+            refuse_mass_delete(desktop, result)
+        except Refused as refusal:
+            assert refusal.code == 409
+            return str(refusal)
+
+    base = [e("Clojure", "closure"), e("Lisp", "list")]
+    # First sync: nothing in common yet, so both lists join.
+    assert merge([], [e("Holon", "whole on")], [e("Kosmos")]) == [e("Holon", "whole on"), e("Kosmos")]
+    # Phone deletes Lisp; desktop adds Holon.
+    assert merge(base, base + [e("Holon")], [e("Clojure", "closure")]) == [e("Clojure", "closure"), e("Holon")]
+    # Desktop deletes Lisp while the phone adds a spelling to it: the edit wins.
+    assert merge(base, [e("Clojure", "closure")], [e("Clojure", "closure"), e("Lisp", "list", "lisped")]) == [e("Clojure", "closure"), e("Lisp", "list", "lisped")]
+    # Both add spellings; the phone drops one.
+    assert merge(base, [e("Clojure", "closure", "clo jure"), e("Lisp", "list")], [e("Clojure", "closure"), e("Lisp")]) == [e("Clojure", "closure", "clo jure"), e("Lisp")]
+    # Same term in different case is one term.
+    assert merge([], [e("Holon")], [e("holon", "whole on")]) == [e("Holon", "whole on")]
+    # Whitespace and case do not make a new term or spelling; display text is whitespace-collapsed.
+    assert merge([], [e("foo  bar")], [e("Foo bar")]) == [e("foo bar")]
+    assert merge([], [e("A", "Hello  World")], [e("a", "hello world")]) == [e("A", "Hello World")]
+    # Spellings with commas split; a spelling equal to its term is dropped.
+    assert clean([e("x", "a, b", "c")]) == [e("x", "a", "b", "c")]
+    assert clean([e("Foo bar", "foo  BAR", "baz")]) == [e("Foo bar", "baz")]
+    # Non-strings are ignored, never stringified.
+    assert clean([{"term": None}, {"term": 5}, "junk", None, {"term": "ok", "sounds_like": [None, 3, "x"]}, {"term": "bare"}]) == [e("ok", "x"), e("bare")]
+    assert clean({"term": "x"}) == []
+    # Hex's limits: 16 spellings, 64 characters, 500 entries.
+    many = [f"s{i}" for i in range(20)]
+    assert merge([], [], [e("t", *many)]) == [e("t", *many[:16])]
+    assert merge([], [], [e("x" * 65), e("y" * 64), e("z", "w" * 65, "ok")]) == [e("y" * 64), e("z", "ok")]
+    assert len(merge([], [e(f"d{i}") for i in range(400)], [e(f"p{i}") for i in range(400)])) == 500
+    # Mass-delete guard: more than max(3, half) of desktop's terms is refused.
+    ten = [e(f"t{i}") for i in range(10)]
+    assert refused(ten, ten[5:]) is None  # 5 of 10 is half
+    assert refused(ten, ten[6:]) == "Refusing to delete 6 terms from desktop Hex in one sync; delete them on the desktop instead"
+    assert refused(ten[:4], ten[3:4]) is None  # 3 of 4: the floor of 3
+    assert refused(ten[:4], []) == "Refusing to delete 4 terms from desktop Hex in one sync; delete them on the desktop instead"
+    assert refused([e("Holon")], [e("holon", "x")]) is None  # an edit is not a deletion
+    print("merge: ok")
+
+
+if __name__ == "__main__":
+    command = sys.argv[1] if len(sys.argv) > 1 else ""
+    {"serve": serve, "pair": pair, "self-test": self_test}.get(command, lambda: sys.exit(__doc__))()

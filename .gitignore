@@ -1,0 +1,16 @@
+# Android / Gradle
+android/.gradle/
+android/build/
+android/app/build/
+android/core/target/
+android/app/src/main/jniLibs/
+android/dist/
+android/local.properties
+android/env.local.sh
+android/.kotlin/
+
+# IDE и ОС
+.idea/
+*.iml
+.DS_Store
+Thumbs.db

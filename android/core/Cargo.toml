@@ -1,0 +1,34 @@
+[package]
+name = "hex-android-core"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Hex's speech engine and dictation text steps for the Android app, over JNI"
+
+# libhexcore.so for the app (cdylib); rlib so `cargo test` runs on the host.
+[lib]
+name = "hexcore"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# CPU only for now. `vulkan` would need the Adreno driver checked first.
+transcribe-cpp = { version = "=0.4.1", default-features = false }
+jni = { version = "0.21", default-features = false }
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# The same engine Hex pins in ../../Cargo.toml (Parakeet vocabulary rescoring
+# lives only in this fork). Keep the two revs equal: a `[patch]` in Hex's
+# workspace never reaches this one.
+[patch.crates-io]
+transcribe-cpp = { git = "https://github.com/anomalyco/transcribe.cpp", rev = "bcb639faa4c74a2300ba19e30360cb2355b1663a" }
+transcribe-cpp-sys = { git = "https://github.com/anomalyco/transcribe.cpp", rev = "bcb639faa4c74a2300ba19e30360cb2355b1663a" }
+
+# Its own workspace, so Hex's root workspace neither claims nor builds it.
+[workspace]
+
+[profile.release]
+strip = true
+lto = "thin"

@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Hex's mark: three nested hexagons, measured from app/AppIcon.icon. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+    <path android:pathData="M12.000,1.684 L20.934,6.842 L20.934,17.158 L12.000,22.316 L3.066,17.158 L3.066,6.842 Z" android:fillColor="#00000000" android:strokeColor="#FFFFFFFF" android:strokeWidth="1.185" android:strokeLineJoin="round" />
+    <path android:pathData="M12.000,5.467 L17.658,8.734 L17.658,15.266 L12.000,18.533 L6.342,15.266 L6.342,8.734 Z" android:fillColor="#00000000" android:strokeColor="#FFFFFFFF" android:strokeWidth="1.151" android:strokeLineJoin="round" />
+    <path android:pathData="M12.000,9.100 L14.511,10.550 L14.511,13.450 L12.000,14.900 L9.489,13.450 L9.489,10.550 Z" android:fillColor="#FFFFFFFF" android:strokeColor="#FFFFFFFF" android:strokeWidth="0.700" android:strokeLineJoin="round" />
+</vector>

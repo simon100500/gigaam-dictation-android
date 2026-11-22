@@ -1,0 +1,18 @@
+# Hex vocabulary sync for Hex on Android: listens on this machine's Tailscale
+# addresses only. Install: ln -s ~/src/hex/android/tools/hex-vocab-sync.service
+# ~/.config/systemd/user/ && systemctl --user enable --now hex-vocab-sync
+[Unit]
+Description=Hex vocabulary sync for Hex on Android (Tailscale only)
+After=network-online.target
+
+[Service]
+ExecStart=%h/src/hex/android/tools/hex-vocab-sync serve
+# serve exits when Tailscale has no address yet; this restart loop is what
+# covers Tailscale coming up late.
+Restart=always
+RestartSec=20
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

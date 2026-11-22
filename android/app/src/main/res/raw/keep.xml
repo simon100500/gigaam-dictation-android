@@ -1,0 +1,3 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Sounds.kt loads the sound sets by name (sound_<set>_<cue>), so keep them all. -->
+<resources xmlns:tools="http://schemas.android.com/tools" tools:keep="@raw/sound_*" />

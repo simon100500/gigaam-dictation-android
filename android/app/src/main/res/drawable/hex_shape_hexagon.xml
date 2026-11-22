@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A bubble shape for the Shape control, drawn like Hex's line icons. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+    <path android:pathData="M12.00,2.50 L20.23,7.25 L20.23,16.75 L12.00,21.50 L3.77,16.75 L3.77,7.25 Z" android:fillColor="#00000000" android:strokeColor="#FFFFFFFF" android:strokeWidth="1.75" android:strokeLineCap="round" android:strokeLineJoin="round" />
+</vector>
